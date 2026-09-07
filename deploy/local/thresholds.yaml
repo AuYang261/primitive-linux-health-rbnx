@@ -1,0 +1,23 @@
+robot_model: linux_health_mock_arm
+rules:
+  - id: linux_cpu_temperature
+    selector: {kind: SENSOR, signal: temperature}
+    warn_above: 80.0
+    error_above: 90.0
+    unit: degC
+  - id: linux_voltage
+    selector: {kind: SENSOR, signal: voltage}
+    unit: V
+  - id: linux_current
+    selector: {kind: SENSOR, signal: current}
+    unit: A
+  - id: linux_battery_soc
+    selector: {kind: BATTERY, signal: soc_percent}
+    warn_below: 20.0
+    error_below: 8.0
+    unit: percent
+  - id: mock_motor_temperature
+    selector: {kind: JOINT, signal: motor_temp}
+    warn_above: 60.0
+    error_above: 75.0
+    unit: degC

@@ -1,0 +1,17 @@
+manifestVersion: 1
+
+package:
+  name: robonix.primitive.health.linux
+  version: 0.1.0
+  description: Read-only Linux compute-node health telemetry from sysfs.
+  tags: [primitive, health, linux, sysfs, hwmon]
+  license: MulanPSL-2.0
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/primitive/health/state
+  - name: robonix/primitive/health/stream
+
+depends: []

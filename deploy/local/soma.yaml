@@ -1,0 +1,42 @@
+urdf:
+  path: mock_robot.urdf
+  root_link: base_link
+  model_name: compute_health_mock_body
+
+robot:
+  id: compute_health_demo
+  display_name: Mock body with real compute-node telemetry
+  family: demonstration
+  root_part: mock_arm
+  exports:
+    - provider_id: linux_health
+      capabilities:
+        - path: robonix/primitive/health/state
+          description: Read Linux compute-node health.
+        - path: robonix/primitive/health/stream
+          description: Stream Linux compute-node health.
+  components:
+    - id: mock_arm
+      display_name: Mock arm
+      type: arm
+      urdf_link: base_link
+      exports: []
+      components:
+        - { id: joint_1, display_name: Mock joint 1, type: joint, urdf_joint: joint_1, exports: [] }
+        - { id: joint_2, display_name: Mock joint 2, type: joint, urdf_joint: joint_2, exports: [] }
+        - { id: joint_3, display_name: Mock joint 3, type: joint, urdf_joint: joint_3, exports: [] }
+    - id: compute_node
+      display_name: Compute node
+      type: computer
+      exports: []
+
+description:
+  summary: Mock robot body with real, read-only Linux compute-node health telemetry.
+  can_do:
+    - Display kernel-exposed CPU temperature, voltage, current and battery charge.
+    - Demonstrate the primitive, Atlas, Soma, Vitals and Client data path.
+  cannot_do:
+    - Control hardware.
+    - Infer measurements not exposed by Linux drivers.
+  notes:
+    - The arm model is synthetic; compute-node readings come from the host sysfs.
