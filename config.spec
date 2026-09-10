@@ -1,5 +1,5 @@
 # Runtime configuration accepted as the package instance's `config:` value.
-# This file documents defaults; the primitive validates them during init.
+# The deployment owns component topology and maps Linux channels to those ids.
 
 config:
   # Positive finite number of seconds between samples.
@@ -8,8 +8,12 @@ config:
   # Linux sysfs mount containing class/{hwmon,thermal,power_supply}.
   sysfs_root: /sys
 
-  # Stable Soma component path below body/.
-  component_prefix: body/compute_node
-
-  # Human-readable compute-node name.
-  display_name: Linux compute node
+  # Required list of Soma-declared component readings. A selector always has
+  # its field-specific metric and may also match device, label, driver,
+  # supply_type, or source exactly.
+  readings:
+    - name: body/compute_node/cpu
+      temp_c: { metric: cpu_temperature, label: cpu-thermal }
+    - name: body/compute_node/input_power
+      voltage: { metric: voltage, driver: ina238, label: in1 }
+      current_a: { metric: current, driver: ina238, label: curr1 }

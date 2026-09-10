@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MulanPSL-2.0
-"""Publish read-only Linux sysfs telemetry through the health primitive contracts."""
+"""Publish configured Linux sysfs telemetry through the existing health contract."""
 
-import hashlib
+from dataclasses import dataclass
 import math
 from pathlib import Path
 import re
@@ -15,89 +15,116 @@ from . import collector
 primitive = Primitive(id="linux_health", namespace="robonix/primitive/health")
 import health_pb2
 
-FIELD_BITS = {
-    "cpu_temperature": 1,
-    "voltage": 2,
-    "current": 4,
-    "battery_percent": 8,
-}
-FIELD_NAMES = {
-    "cpu_temperature": "temp_c",
+FIELD_METRICS = {
+    "temp_c": "cpu_temperature",
     "voltage": "voltage",
-    "current": "current_a",
+    "current_a": "current",
     "battery_percent": "battery_percent",
 }
-QUALITY = {"valid": 0, "stale": 1, "unavailable": 2, "invalid": 3}
-SUPPORTED_METRICS = frozenset(FIELD_BITS)
+MATCH_KEYS = frozenset({"metric", "device", "label", "driver", "supply_type", "source"})
+_COMPONENT_ID = re.compile(r"body(?:/[A-Za-z0-9_.-]+)+")
+
+
+@dataclass(frozen=True)
+class Selector:
+    """Match one collector item using deployment-owned hardware identity."""
+
+    values: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def from_config(cls, field, raw):
+        """Validate one field selector from the primitive instance config."""
+        if not isinstance(raw, dict):
+            raise ValueError(f"{field} selector must be an object")
+        unsupported = sorted(set(raw) - MATCH_KEYS)
+        if unsupported:
+            raise ValueError(f"{field} selector has unsupported keys: {', '.join(unsupported)}")
+        metric = str(raw.get("metric", "")).strip()
+        if metric != FIELD_METRICS[field]:
+            raise ValueError(f"{field} selector metric must be {FIELD_METRICS[field]}")
+        values = tuple(
+            (key, str(value).strip())
+            for key, value in sorted(raw.items())
+            if str(value).strip()
+        )
+        return cls(values)
+
+    def matches(self, item):
+        """Return whether all configured attributes match one collected channel."""
+        return all(str(item.get(key, "")) == value for key, value in self.values)
+
+
+@dataclass(frozen=True)
+class ReadingMapping:
+    """Map selected sysfs channels into one Soma-declared component reading."""
+
+    name: str
+    fields: tuple[tuple[str, Selector], ...]
+
+    @classmethod
+    def from_config(cls, raw):
+        """Validate a stable component id and one or more scalar selectors."""
+        if not isinstance(raw, dict):
+            raise ValueError("each readings entry must be an object")
+        name = str(raw.get("name", "")).strip()
+        if len(name) > 200 or not _COMPONENT_ID.fullmatch(name):
+            raise ValueError("reading name must be a safe component path below body/")
+        unsupported = sorted(set(raw) - {"name", *FIELD_METRICS})
+        if unsupported:
+            raise ValueError(f"reading {name} has unsupported keys: {', '.join(unsupported)}")
+        fields = tuple(
+            (field, Selector.from_config(field, raw[field]))
+            for field in FIELD_METRICS
+            if field in raw
+        )
+        if not fields:
+            raise ValueError(f"reading {name} must configure at least one scalar field")
+        return cls(name=name, fields=fields)
+
 
 _stop = threading.Event()
 _lock = threading.Lock()
 _interval_s = 1.0
 _sysfs_root = Path("/sys")
-_component_prefix = "body/compute_node"
-_display_name = "Linux compute node"
+_mappings = ()
 
 
-def _channel_id(item):
-    """Return a stable readable id while preventing source-path collisions."""
-    label = f"{item['device']}_{item['label']}_{item['metric']}"
-    readable = re.sub(r"[^a-zA-Z0-9_]+", "_", label).strip("_")[:64] or "sensor"
-    digest = hashlib.sha256(item["source"].encode()).hexdigest()[:10]
-    return f"{readable}_{digest}"
-
-
-def _reading(item):
-    """Project one sysfs channel without changing its sign or inventing values."""
-    metric = item["metric"]
-    values = {
-        "temp_c": -1.0,
-        "voltage": -1.0,
-        "current_a": -1.0,
-        "battery_percent": -1.0,
-    }
-    observed_fields = 0
-    value = item.get("value")
-    if item.get("quality") == "valid" and value is not None and math.isfinite(value):
-        values[FIELD_NAMES[metric]] = value
-        observed_fields = FIELD_BITS[metric]
-    driver = item.get("driver") or item.get("supply_type") or "Linux"
-    display_name = f"{driver}: {item['device']}/{item['label']}"
-    component_type = "battery" if metric == "battery_percent" else "sensor"
-    return health_pb2.SensorReading(
-        name=f"{_component_prefix}/{_channel_id(item)}",
-        observed_fields=observed_fields,
-        quality=QUALITY.get(item.get("quality"), QUALITY["invalid"]),
-        display_name=display_name,
-        component_type=component_type,
-        source=item["source"],
-        **values,
-    )
+def _mapped_reading(mapping, items):
+    """Build one legacy SensorReading, omitting values its sentinel cannot represent."""
+    values = {field: -1.0 for field in FIELD_METRICS}
+    observed = False
+    for field, selector in mapping.fields:
+        for item in items:
+            if not selector.matches(item) or item.get("quality") != "valid":
+                continue
+            value = item.get("value")
+            if value is None or not math.isfinite(value) or value < 0:
+                continue
+            values[field] = value
+            observed = True
+            break
+    if not observed:
+        return None
+    return health_pb2.SensorReading(name=mapping.name, **values)
 
 
 def build_health_state():
-    """Collect one frame and expose only kernel-reported channels."""
+    """Collect one frame and publish only deployment-configured component readings."""
     with _lock:
         report = collector.collect(_sysfs_root)
+        items = report["readings"]
         readings = [
-            health_pb2.SensorReading(
-                name=_component_prefix,
-                temp_c=-1.0,
-                voltage=-1.0,
-                current_a=-1.0,
-                battery_percent=-1.0,
-                display_name=_display_name,
-                component_type="computer",
-                source=str(_sysfs_root),
-            )
+            reading
+            for mapping in _mappings
+            if (reading := _mapped_reading(mapping, items)) is not None
         ]
-        readings.extend(
-            _reading(item)
-            for item in report["readings"]
-            if item["metric"] in SUPPORTED_METRICS
+        charging = any(
+            item.get("metric") == "battery_percent" and item.get("status") == "Charging"
+            for item in items
         )
         return health_pb2.HealthState(
             voltage=-1.0,
-            charging=False,
+            charging=charging,
             remaining_s=-1,
             readings=readings,
         )
@@ -111,7 +138,7 @@ def get_health_state(_request):
 
 @primitive.grpc("robonix/primitive/health/stream")
 def stream_health_state(_request, context):
-    """Stream a fresh frame at the configured interval until shutdown."""
+    """Stream fresh frames at the configured interval until shutdown."""
     while context.is_active() and not _stop.is_set():
         yield build_health_state()
         _stop.wait(_interval_s)
@@ -119,8 +146,8 @@ def stream_health_state(_request, context):
 
 @primitive.on_init
 def init(config):
-    """Validate deployment configuration without writing to sysfs."""
-    global _component_prefix, _display_name, _interval_s, _sysfs_root
+    """Validate sysfs access and deployment-owned channel mappings."""
+    global _interval_s, _mappings, _sysfs_root
     try:
         interval_s = float(config.get("interval_s", 1.0))
         if not math.isfinite(interval_s) or interval_s <= 0:
@@ -128,18 +155,16 @@ def init(config):
         sysfs_root = Path(config.get("sysfs_root", "/sys"))
         if not (sysfs_root / "class").is_dir():
             raise ValueError("sysfs_root must contain a class directory")
-        component_prefix = str(config.get("component_prefix", "body/compute_node")).strip("/")
-        if len(component_prefix) > 200 or not re.fullmatch(
-            r"body(?:/[A-Za-z0-9_.-]+)+", component_prefix
-        ):
-            raise ValueError("component_prefix must use safe path segments below body/")
-        display_name = str(config.get("display_name", "Linux compute node")).strip()
-        if not display_name:
-            raise ValueError("display_name must not be empty")
+        raw_mappings = config.get("readings")
+        if not isinstance(raw_mappings, list) or not raw_mappings:
+            raise ValueError("readings must be a non-empty list")
+        mappings = tuple(ReadingMapping.from_config(raw) for raw in raw_mappings)
+        names = [mapping.name for mapping in mappings]
+        if len(names) != len(set(names)):
+            raise ValueError("reading names must be unique")
         _interval_s = interval_s
         _sysfs_root = sysfs_root
-        _component_prefix = component_prefix
-        _display_name = display_name
+        _mappings = mappings
         _stop.clear()
         return Ok()
     except (OSError, TypeError, ValueError) as error:
